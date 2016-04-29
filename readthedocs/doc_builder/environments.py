@@ -30,12 +30,13 @@ from .exceptions import (BuildEnvironmentException, BuildEnvironmentError,
 from .constants import (DOCKER_SOCKET, DOCKER_VERSION, DOCKER_IMAGE,
                         DOCKER_LIMITS, DOCKER_TIMEOUT_EXIT_CODE,
                         DOCKER_OOM_EXIT_CODE, SPHINX_TEMPLATE_DIR,
-                        MKDOCS_TEMPLATE_DIR)
+                        MKDOCS_TEMPLATE_DIR, DOCKER_HOSTNAME_MAX_LEN)
 
 log = logging.getLogger(__name__)
 
 
 class BuildCommand(BuildCommandResultMixin):
+
     '''Wrap command execution for execution in build environments
 
     This wraps subprocess commands with some logic to handle exceptions,
@@ -67,6 +68,7 @@ class BuildCommand(BuildCommandResultMixin):
         self.cwd = cwd
         self.environment = os.environ.copy()
         if environment is not None:
+            assert 'PATH' not in environment, "PATH can't be set"
             self.environment.update(environment)
 
         self.combine_output = combine_output
@@ -177,6 +179,7 @@ class BuildCommand(BuildCommandResultMixin):
 
 
 class DockerBuildCommand(BuildCommand):
+
     '''Create a docker container and run a command inside the container
 
     Build command to execute in docker container
@@ -234,7 +237,7 @@ class DockerBuildCommand(BuildCommand):
         """
         bash_escape_re = re.compile(r"([\t\ \!\"\#\$\&\'\(\)\*\:\;\<\>\?\@"
                                     r"\[\\\]\^\`\{\|\}\~])")
-        prefix = 'READTHEDOCS=True '
+        prefix = ''
         if self.bin_path:
             prefix += 'PATH={0}:$PATH '.format(self.bin_path)
         return ("/bin/sh -c 'cd {cwd} && {prefix}{cmd}'"
@@ -246,22 +249,31 @@ class DockerBuildCommand(BuildCommand):
 
 
 class BuildEnvironment(object):
-    '''
-    Base build environment
 
-    Placeholder for reorganizing command execution.
+    """Base build environment
+
+    Base class for wrapping command execution for build steps. This provides a
+    context for command execution and reporting, and eventually performs updates
+    on the build object itself, reporting success/failure, as well as top-level
+    failures.
 
     :param project: Project that is being built
     :param version: Project version that is being built
     :param build: Build instance
     :param record: Record status of build object
-    '''
+    :param environment: shell environment variables
+    :param report_build_success: update build if successful
+    """
 
-    def __init__(self, project=None, version=None, build=None, record=True):
+    def __init__(self, project=None, version=None, build=None, record=True,
+                 environment=None, report_build_success=True):
         self.project = project
         self.version = version
         self.build = build
         self.record = record
+        self.environment = environment or {}
+        self.report_build_success = report_build_success
+
         self.commands = []
         self.failure = None
         self.start_time = datetime.utcnow()
@@ -315,6 +327,12 @@ class BuildEnvironment(object):
         :param warn_only: Don't raise an exception on command failure
         '''
         warn_only = kwargs.pop('warn_only', False)
+        # Remove PATH from env, and set it to bin_path if it isn't passed in
+        env_path = self.environment.pop('BIN_PATH', None)
+        if 'bin_path' not in kwargs and env_path:
+            kwargs['bin_path'] = env_path
+        assert 'environment' not in kwargs, "environment can't be passed in via commands."
+        kwargs['environment'] = self.environment
         kwargs['build_env'] = self
         build_cmd = cls(cmd, **kwargs)
         self.commands.append(build_cmd)
@@ -360,12 +378,14 @@ class BuildEnvironment(object):
                 self.build['state'] == BUILD_STATE_FINISHED)
 
     def update_build(self, state=None):
-        """
-        Record a build by hitting the API.
+        """Record a build by hitting the API
 
-        Returns nothing
+        This step is skipped if we aren't recording the build, or if we don't
+        want to record successful builds yet (if we are running setup commands
+        for the build)
         """
-        if not self.record:
+        if not self.record or (state == BUILD_STATE_FINISHED and
+                               not self.report_build_success):
             return None
 
         self.build['project'] = self.project.pk
@@ -406,11 +426,13 @@ class BuildEnvironment(object):
 
 
 class LocalEnvironment(BuildEnvironment):
+
     '''Local execution environment'''
     command_class = BuildCommand
 
 
 class DockerEnvironment(BuildEnvironment):
+
     '''
     Docker build environment, uses docker to contain builds
 
@@ -434,9 +456,17 @@ class DockerEnvironment(BuildEnvironment):
         super(DockerEnvironment, self).__init__(*args, **kwargs)
         self.client = None
         self.container = None
-        self.container_name = None
-        if self.version:
-            self.container_name = slugify(unicode(self.version))
+        self.container_name = slugify(
+            'build-{build}-project-{project_id}-{project_name}'.format(
+                build=self.build.get('id'),
+                project_id=self.project.pk,
+                project_name=self.project.slug,
+            )[:DOCKER_HOSTNAME_MAX_LEN]
+        )
+        if self.project.container_mem_limit:
+            self.container_mem_limit = self.project.container_mem_limit
+        if self.project.container_time_limit:
+            self.container_time_limit = self.project.container_time_limit
 
     def __enter__(self):
         '''Start of environment context'''
@@ -448,7 +478,7 @@ class DockerEnvironment(BuildEnvironment):
             # locking code, so we throw an exception.
             state = self.container_state()
             if state is not None:
-                if state.get('Running') == True:
+                if state.get('Running') is True:
                     exc = BuildEnvironmentError(
                         _('A build environment is currently '
                           'running for this version'))
@@ -583,11 +613,11 @@ class DockerEnvironment(BuildEnvironment):
                 host_config=create_host_config(binds={
                     SPHINX_TEMPLATE_DIR: {
                         'bind': SPHINX_TEMPLATE_DIR,
-                        'mode': 'r'
+                        'mode': 'ro'
                     },
                     MKDOCS_TEMPLATE_DIR: {
                         'bind': MKDOCS_TEMPLATE_DIR,
-                        'mode': 'r'
+                        'mode': 'ro'
                     },
                     self.project.doc_path: {
                         'bind': self.project.doc_path,
@@ -595,8 +625,7 @@ class DockerEnvironment(BuildEnvironment):
                     },
                 }),
                 detach=True,
-                environment={'READTHEDOCS_VERSION': self.version.slug,
-                             'READTHEDOCS_PROJECT': self.project.slug},
+                environment=self.environment,
                 mem_limit=self.container_mem_limit,
             )
             client.start(container=self.container_id)

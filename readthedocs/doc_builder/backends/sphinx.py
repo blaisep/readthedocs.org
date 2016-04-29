@@ -97,7 +97,8 @@ class BaseSphinx(BaseBuilder):
                 'static_path': SPHINX_STATIC_DIR,
                 'template_path': SPHINX_TEMPLATE_DIR,
                 'conf_py_path': conf_py_path,
-                'api_host': getattr(settings, 'SLUMBER_API_HOST', 'https://readthedocs.org'),
+                'api_host': getattr(settings, 'PUBLIC_API_URL',
+                                    'https://readthedocs.org'),
                 # GitHub
                 'github_user': github_user,
                 'github_repo': github_repo,
@@ -138,7 +139,7 @@ class BaseSphinx(BaseBuilder):
         project = self.project
         build_command = [
             'python',
-            project.venv_bin(version=self.version.slug, filename='sphinx-build'),
+            self.python_env.venv_bin(filename='sphinx-build'),
             '-T'
         ]
         if self._force:
@@ -153,7 +154,7 @@ class BaseSphinx(BaseBuilder):
         cmd_ret = self.run(
             *build_command,
             cwd=project.conf_dir(self.version.slug),
-            bin_path=project.venv_bin(version=self.version.slug)
+            bin_path=self.python_env.venv_bin()
         )
         return cmd_ret.successful
 
@@ -237,6 +238,7 @@ class EpubBuilder(BaseSphinx):
 
 
 class LatexBuildCommand(BuildCommand):
+
     '''Ignore LaTeX exit code if there was file output'''
 
     def run(self):
@@ -259,15 +261,14 @@ class PdfBuilder(BaseSphinx):
         # Default to this so we can return it always.
         self.run(
             'python',
-            self.project.venv_bin(version=self.version.slug,
-                                  filename='sphinx-build'),
+            self.python_env.venv_bin(filename='sphinx-build'),
             '-b', 'latex',
             '-D', 'language={lang}'.format(lang=self.project.language),
             '-d', '_build/doctrees',
             '.',
             '_build/latex',
             cwd=cwd,
-            bin_path=self.project.venv_bin(version=self.version.slug)
+            bin_path=self.python_env.venv_bin()
         )
         latex_cwd = os.path.join(cwd, '_build', 'latex')
         tex_files = glob(os.path.join(latex_cwd, '*.tex'))

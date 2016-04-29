@@ -8,11 +8,12 @@ from django.contrib import messages
 from django.core.urlresolvers import reverse
 from django.conf import settings
 from django.http import (HttpResponseRedirect, HttpResponseNotAllowed,
-                         Http404,  HttpResponseBadRequest)
+                         Http404, HttpResponseBadRequest)
 from django.shortcuts import get_object_or_404, render_to_response, render
 from django.template import RequestContext
 from django.views.generic import View, TemplateView, ListView
 from django.utils.translation import ugettext_lazy as _
+from django.utils.safestring import mark_safe
 from django.middleware.csrf import get_token
 from formtools.wizard.views import SessionWizardView
 from allauth.socialaccount.models import SocialAccount
@@ -24,18 +25,18 @@ from readthedocs.builds.models import Version
 from readthedocs.builds.forms import AliasForm, VersionForm
 from readthedocs.builds.filters import VersionFilter
 from readthedocs.builds.models import VersionAlias
-from readthedocs.core.utils import trigger_build
+from readthedocs.core.utils import trigger_build, broadcast
 from readthedocs.core.mixins import ListViewWithForm
 from readthedocs.projects.forms import (
     ProjectBasicsForm, ProjectExtraForm,
     ProjectAdvancedForm, UpdateProjectForm, SubprojectForm,
     build_versions_form, UserForm, EmailHookForm, TranslationForm,
-    RedirectForm, WebHookForm, DomainForm)
+    RedirectForm, WebHookForm, DomainForm, ProjectAdvertisingForm)
 from readthedocs.projects.models import Project, EmailHook, WebHook, Domain
 from readthedocs.projects.views.base import ProjectAdminMixin, ProjectSpamMixin
 from readthedocs.projects import constants, tasks
-from readthedocs.projects.exceptions import ProjectSpamError
-from readthedocs.projects.tasks import remove_dir, clear_artifacts
+from readthedocs.oauth.services import registry
+from readthedocs.oauth.utils import attach_webhook
 
 from readthedocs.core.mixins import LoginRequiredMixin
 from readthedocs.projects.signals import project_import
@@ -174,7 +175,7 @@ def project_version_detail(request, project_slug, version_slug):
         if form.has_changed():
             if 'active' in form.changed_data and version.active is False:
                 log.info('Removing files for version %s' % version.slug)
-                clear_artifacts.delay(version_pk=version.pk)
+                broadcast(type='app', task=tasks.clear_artifacts, args=[version.pk])
                 version.built = False
                 version.save()
         url = reverse('project_version_list', args=[project.slug])
@@ -198,16 +199,7 @@ def project_delete(request, project_slug):
                                 slug=project_slug)
 
     if request.method == 'POST':
-        # Support hacky "broadcast" with MULTIPLE_APP_SERVERS setting,
-        # otherwise put in normal celery queue
-        for server in getattr(settings, "MULTIPLE_APP_SERVERS", ['celery']):
-            log.info('Removing files on %s' % server)
-            remove_dir.apply_async(
-                args=[project.doc_path],
-                queue=server,
-            )
-
-        # Delete the project and everything related to it
+        broadcast(type='app', task=tasks.remove_dir, args=[project.doc_path])
         project.delete()
         messages.success(request, _('Project deleted'))
         project_dashboard = reverse('projects_dashboard')
@@ -344,6 +336,31 @@ class ImportView(PrivateViewMixin, TemplateView):
     template_name = 'projects/project_import.html'
     wizard_class = ImportWizardView
 
+    def get(self, request, *args, **kwargs):
+        '''Display list of repositories to import
+
+        Adds a warning to the listing if any of the accounts connected for the
+        user are not supported accounts.
+        '''
+        deprecated_accounts = (
+            SocialAccount.objects
+            .filter(user=self.request.user)
+            .exclude(provider__in=[service.adapter.provider_id
+                                   for service in registry])
+        )
+        for account in deprecated_accounts:
+            provider_account = account.get_provider_account()
+            messages.error(
+                request,
+                mark_safe(
+                    (_('There is a problem with your {service} account, '
+                       'try reconnecting your account on your '
+                       '<a href="{url}">connected services page</a>.')
+                     .format(service=provider_account.get_brand()['name'],
+                             url=reverse('socialaccount_connections'))))
+            )
+        return super(ImportView, self).get(request, *args, **kwargs)
+
     def post(self, request, *args, **kwargs):
         initial_data = {}
         initial_data['basics'] = {}
@@ -411,6 +428,7 @@ def project_subprojects(request, project_slug):
         form = SubprojectForm(request.POST, **form_kwargs)
         if form.is_valid():
             form.save()
+            broadcast(type='app', task=tasks.symlink_subproject, args=[project.pk])
             project_dashboard = reverse(
                 'projects_subprojects', args=[project.slug])
             return HttpResponseRedirect(project_dashboard)
@@ -431,6 +449,7 @@ def project_subprojects_delete(request, project_slug, child_slug):
     parent = get_object_or_404(Project.objects.for_admin_user(request.user), slug=project_slug)
     child = get_object_or_404(Project.objects.all(), slug=child_slug)
     parent.remove_subproject(child)
+    broadcast(type='app', task=tasks.symlink_subproject, args=[parent.pk])
     return HttpResponseRedirect(reverse('projects_subprojects',
                                         args=[parent.slug]))
 
@@ -620,7 +639,7 @@ def project_version_delete_html(request, project_slug, version_slug):
     if not version.active:
         version.built = False
         version.save()
-        tasks.clear_artifacts.delay(version.pk)
+        broadcast(type='app', task=tasks.clear_artifacts, args=[version.pk])
     else:
         return HttpResponseBadRequest("Can't delete HTML for an active version.")
     return HttpResponseRedirect(
@@ -647,3 +666,40 @@ class DomainUpdate(DomainMixin, UpdateView):
 
 class DomainDelete(DomainMixin, DeleteView):
     pass
+
+
+@login_required
+def project_resync_webhook(request, project_slug):
+    """
+    Resync a project webhook.
+
+    The signal will add a success/failure message on the request.
+    """
+    project = get_object_or_404(Project.objects.for_admin_user(request.user),
+                                slug=project_slug)
+    if request.method == 'POST':
+        attach_webhook(project=project, request=request)
+        return HttpResponseRedirect(reverse('projects_detail',
+                                            args=[project.slug]))
+
+    return render_to_response(
+        'projects/project_resync_webhook.html',
+        {'project': project},
+        context_instance=RequestContext(request)
+    )
+
+
+class ProjectAdvertisingUpdate(PrivateViewMixin, UpdateView):
+
+    model = Project
+    form_class = ProjectAdvertisingForm
+    success_message = _('Project has been opted out from advertisement support')
+    template_name = 'projects/project_advertising.html'
+    lookup_url_kwarg = 'project_slug'
+    lookup_field = 'slug'
+
+    def get_queryset(self):
+        return self.model.objects.for_admin_user(self.request.user)
+
+    def get_success_url(self):
+        return reverse('projects_advertising', args=[self.object.slug])

@@ -46,7 +46,6 @@ class ProjectResource(ModelResource, SearchMixin):
         return super(ProjectResource, self).get_object_list(request)
 
     def dehydrate(self, bundle):
-        bundle.data['subdomain'] = "http://%s/" % bundle.obj.subdomain
         bundle.data['downloads'] = bundle.obj.get_downloads()
         return bundle
 
@@ -91,7 +90,7 @@ class ProjectResource(ModelResource, SearchMixin):
             self._sync_versions(project, data['tags'])
             self._sync_versions(project, data['branches'])
             deleted_versions = self._delete_versions(project, data)
-        except Exception, e:
+        except Exception as e:
             return self.create_response(
                 request,
                 {'exception': e.message},
@@ -129,13 +128,6 @@ class VersionResource(ModelResource):
             "slug": ALL_WITH_RELATIONS,
             "active": ALL,
         }
-
-    # Find a better name for this before including it.
-    # def dehydrate(self, bundle):
-    #     bundle.data['subdomain'] = "http://%s/en/%s/" % (
-    #         bundle.obj.project.subdomain, bundle.obj.slug
-    #     )
-    #     return bundle
 
     def get_object_list(self, request):
         self._meta.queryset = Version.objects.api(user=request.user)

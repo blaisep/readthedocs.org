@@ -2,6 +2,7 @@ from django.http import HttpResponseRedirect
 import logging
 import re
 
+from readthedocs.constants import LANGUAGES_REGEX
 from readthedocs.projects.models import Project
 
 
@@ -17,8 +18,11 @@ def project_and_path_from_request(request, path):
         match = re.match(
             r'^/docs/(?P<project_slug>[^/]+)(?P<path>/.*)$',
             path)
-        project_slug = match.groupdict()['project_slug']
-        path = match.groupdict()['path']
+        if match:
+            project_slug = match.groupdict()['project_slug']
+            path = match.groupdict()['path']
+        else:
+            return None, path
     else:
         return None, path
 
@@ -31,7 +35,7 @@ def project_and_path_from_request(request, path):
 
 def language_and_version_from_path(path):
     match = re.match(
-        r'^/(?P<language>[^/]+)/(?P<version_slug>[^/]+)(?P<path>/.*)$',
+        r'^/(?P<language>%s)/(?P<version_slug>[^/]+)(?P<path>/.*)$' % LANGUAGES_REGEX,
         path)
     if match:
         language = match.groupdict()['language']
